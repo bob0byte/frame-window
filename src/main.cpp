@@ -2,13 +2,16 @@
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PauseLayer.hpp>
+#include <Geode/modify/PlayerObject.hpp>
+#include <Geode/modify/HardStreak.hpp>
+#include <Geode/modify/GameObject.hpp>
 
 using namespace geode::prelude;
 
 // settings, saved between sessions; x/y are fractions of the screen (0..1)
 struct CounterSettings {
 	static bool enabled() { return Mod::get()->getSavedValue<bool>("enabled", true); }
-	static bool orbLabels() { return Mod::get()->getSavedValue<bool>("orb-labels", true); }
+	static bool clickLabels() { return Mod::get()->getSavedValue<bool>("click-labels", true); }
 	static float x() { return Mod::get()->getSavedValue<float>("x", 0.01f); }
 	static float y() { return Mod::get()->getSavedValue<float>("y", 0.98f); }
 	static float scale() { return Mod::get()->getSavedValue<float>("scale", 0.5f); }
@@ -56,6 +59,167 @@ static void applyPanelSettings(CCNode* panel) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Trajectory simulation
+//
+// Every physics tick we save player 1's state and whether jump is held. When
+// the player presses jump on tick F, we wait HORIZON ticks, then replay that
+// stretch with an invisible fake player, moving the press 1, 2, 3... ticks
+// earlier and later. The window is the number of press ticks that survive.
+// ---------------------------------------------------------------------------
+
+static constexpr int MAX_SHIFT = 12;  // furthest shift tried on each side
+static constexpr int HORIZON = 60;    // ticks after the press that must be survived
+static constexpr int BUFFER = 128;    // must be > HORIZON + MAX_SHIFT + 1
+
+struct Snapshot {
+	int tick = -1;
+	Ref<PlayerCheckpoint> checkpoint;
+	CCPoint position;
+	double yVelocity = 0;
+	bool onGround = false;
+	float rotation = 0.f;
+	bool held = false;  // jump held during this tick
+};
+
+struct RingUse {
+	RingObject* ring;
+	int tick;
+	bool activated, disabled, disabled2;  // flags before the real player used it
+};
+
+struct Sim {
+	PlayerObject* fake = nullptr;
+	bool simulating = false;
+	bool fakeDied = false;
+	int tick = 0;
+	float dt = 0.25f;
+	bool held = false;
+	int realDeathTick = -1;
+	std::array<Snapshot, BUFFER> snaps;
+	std::vector<int> pending;
+	std::deque<RingUse> ringUses;
+
+	static Sim& get() {
+		static Sim instance;
+		return instance;
+	}
+
+	void reset() {
+		tick = 0;
+		held = false;
+		realDeathTick = -1;
+		pending.clear();
+		ringUses.clear();
+		for (auto& s : snaps) s.tick = -1;
+	}
+
+	Snapshot* snap(int t) {
+		if (t < 0) return nullptr;
+		auto& s = snaps[t % BUFFER];
+		return s.tick == t ? &s : nullptr;
+	}
+
+	void record(PlayerObject* player) {
+		auto& s = snaps[tick % BUFFER];
+		if (!s.checkpoint) s.checkpoint = PlayerCheckpoint::create();
+		player->saveToCheckpoint(s.checkpoint);
+		s.position = player->getPosition();
+		s.yVelocity = player->m_yVelocity;
+		s.onGround = player->m_isOnGround;
+		s.rotation = player->getRotation();
+		s.held = held;
+		s.tick = tick;
+	}
+
+	// input for tick t when the press at `press` is shifted by `shift` ticks
+	bool heldAt(int t, int press, int shift) {
+		auto s = snap(t);
+		bool h = s && s->held;
+		if (shift < 0 && t >= press + shift && t < press) return true;
+		if (shift > 0) {
+			if (t == press + shift) return true;
+			if (t >= press && t < press + shift) return false;
+		}
+		return h;
+	}
+
+	static void clearLogs(PlayerObject* p) {
+		p->m_collisionLogTop->removeAllObjects();
+		p->m_collisionLogBottom->removeAllObjects();
+		p->m_collisionLogLeft->removeAllObjects();
+		p->m_collisionLogRight->removeAllObjects();
+	}
+
+	// true if the fake player survives to press + HORIZON
+	bool survives(GJBaseGameLayer* layer, int press, int shift) {
+		int start = press + std::min(shift, 0);
+		auto s = snap(start);
+		if (!s || !fake) return false;
+
+		// rings the real player used since `start` must look unused again
+		std::vector<RingUse> restore;
+		for (auto it = ringUses.rbegin(); it != ringUses.rend(); ++it) {
+			if (it->tick < start) continue;
+			auto r = it->ring;
+			restore.push_back({r, 0, r->m_isActivated, r->m_isDisabled, r->m_isDisabled2});
+			r->m_isActivated = it->activated;
+			r->m_isDisabled = it->disabled;
+			r->m_isDisabled2 = it->disabled2;
+		}
+
+		fake->loadFromCheckpoint(s->checkpoint);
+		fake->setPosition(s->position);
+		fake->m_yVelocity = s->yVelocity;
+		fake->m_isOnGround = s->onGround;
+		fake->setRotation(s->rotation);
+		fake->m_isDead = false;
+		if (fake->m_touchingRings) fake->m_touchingRings->removeAllObjects();
+		fake->releaseButton(PlayerButton::Jump);
+
+		simulating = true;
+		fakeDied = false;
+		bool prev = false;
+		for (int t = start; t <= press + HORIZON && !fakeDied; t++) {
+			bool h = this->heldAt(t, press, shift);
+			if (h != prev) {
+				h ? fake->pushButton(PlayerButton::Jump) : fake->releaseButton(PlayerButton::Jump);
+				prev = h;
+			}
+			clearLogs(fake);
+			layer->checkCollisions(fake, dt, false);
+			if (fakeDied) break;
+			fake->update(dt);
+			fake->updateRotation(dt);
+			fake->updatePlayerScale();
+		}
+		simulating = false;
+
+		for (auto& r : restore) {
+			r.ring->m_isActivated = r.activated;
+			r.ring->m_isDisabled = r.disabled;
+			r.ring->m_isDisabled2 = r.disabled2;
+		}
+		return !fakeDied;
+	}
+
+	// frames in a row the press could have happened on, or -1 if unknown
+	int measure(GJBaseGameLayer* layer, int press) {
+		if (realDeathTick >= press && realDeathTick <= press + HORIZON) return -1;
+		// if the unshifted replay dies, the simulation doesn't match this spot
+		if (!this->survives(layer, press, 0)) return -1;
+
+		int window = 1;
+		for (int k = 1; k <= MAX_SHIFT && this->survives(layer, press, -k); k++) window++;
+		for (int k = 1; k <= MAX_SHIFT && this->survives(layer, press, k); k++) window++;
+		return window;
+	}
+};
+
+// ---------------------------------------------------------------------------
+// Settings popup
+// ---------------------------------------------------------------------------
+
 class FrameCounterPopup : public Popup {
 protected:
 	struct Row {
@@ -71,7 +235,7 @@ protected:
 		this->setTitle("Frame Window Counter");
 
 		this->addToggle("Show counter", "enabled", CounterSettings::enabled(), -50.f);
-		this->addToggle("Orb numbers", "orb-labels", CounterSettings::orbLabels(), -82.f);
+		this->addToggle("Click numbers", "click-labels", CounterSettings::clickLabels(), -82.f);
 
 		this->addRow("Size", "scale", 0.15f, 1.5f, -120.f);
 		this->addRow("Move X", "x", 0.f, 1.f, -155.f);
@@ -204,19 +368,21 @@ class $modify(FrameCounterPause, PauseLayer) {
 	}
 };
 
+// ---------------------------------------------------------------------------
+// Play layer: panel, labels and per-tick recording
+// ---------------------------------------------------------------------------
+
 class $modify(FrameCounterPL, PlayLayer) {
 	struct Fields {
 		CCNode* panel = nullptr;
 		std::array<CCLabelBMFont*, BUCKET_COUNT> countLabels{};
 		std::array<int, BUCKET_COUNT> counts{};
-		// frames the player has been touching each orb so far
-		std::unordered_map<RingObject*, int> touching;
-		// orbs whose window has already been measured
-		std::unordered_set<RingObject*> measured;
-		std::unordered_map<RingObject*, CCLabelBMFont*> orbLabels;
+		std::vector<CCLabelBMFont*> clickLabels;
 	};
 
 	bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
+		Sim::get().reset();
+		Sim::get().fake = nullptr;
 		if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
 
 		auto panel = CCNode::create();
@@ -242,45 +408,48 @@ class $modify(FrameCounterPL, PlayLayer) {
 		return true;
 	}
 
+	void setupHasCompleted() {
+		PlayLayer::setupHasCompleted();
+		auto fake = PlayerObject::create(1, 1, this, this, true);
+		fake->setPosition({0.f, 105.f});
+		fake->setVisible(false);
+		m_objectLayer->addChild(fake);
+		Sim::get().fake = fake;
+	}
+
+	void onQuit() {
+		Sim::get().fake = nullptr;
+		Sim::get().reset();
+		PlayLayer::onQuit();
+	}
+
 	void resetLevel() {
 		PlayLayer::resetLevel();
+		Sim::get().reset();
 		auto f = m_fields.self();
 		f->counts.fill(0);
-		f->touching.clear();
-		f->measured.clear();
 		for (auto label : f->countLabels) {
 			if (label) label->setString("0");
 		}
+		for (auto label : f->clickLabels) label->removeFromParent();
+		f->clickLabels.clear();
 	}
 
-	// called once per physics tick
-	void trackOrbs() {
-		auto f = m_fields.self();
-		std::unordered_set<RingObject*> now;
-		for (auto player : {m_player1, m_player2}) {
-			if (!player || !player->m_touchingRings) continue;
-			for (auto ring : CCArrayExt<RingObject*>(player->m_touchingRings)) {
-				now.insert(ring);
-			}
+	void destroyPlayer(PlayerObject* player, GameObject* object) {
+		auto& sim = Sim::get();
+		if (sim.simulating || player == sim.fake) {
+			sim.fakeDied = true;
+			return;
 		}
-
-		for (auto ring : now) {
-			if (!f->measured.contains(ring)) f->touching[ring]++;
-		}
-
-		// an orb the player stopped touching has a finished window
-		for (auto it = f->touching.begin(); it != f->touching.end();) {
-			if (now.contains(it->first)) {
-				++it;
-				continue;
-			}
-			this->recordWindow(it->first, it->second);
-			f->measured.insert(it->first);
-			it = f->touching.erase(it);
-		}
+		if (player == m_player1 && sim.realDeathTick < 0) sim.realDeathTick = sim.tick;
+		PlayLayer::destroyPlayer(player, object);
 	}
 
-	void recordWindow(RingObject* ring, int frames) {
+	void playEndAnimationToPos(CCPoint pos) {
+		if (!Sim::get().simulating) PlayLayer::playEndAnimationToPos(pos);
+	}
+
+	void recordWindow(int press, int frames) {
 		auto f = m_fields.self();
 		auto b = bucketFor(frames);
 		if (b >= 0) {
@@ -288,26 +457,143 @@ class $modify(FrameCounterPL, PlayLayer) {
 			f->countLabels[b]->setString(std::to_string(f->counts[b]).c_str());
 		}
 
-		if (!CounterSettings::orbLabels() || !m_objectLayer) return;
-		auto& label = f->orbLabels[ring];
-		if (!label) {
-			label = CCLabelBMFont::create("", "bigFont.fnt");
-			label->setScale(0.45f);
-			label->setAnchorPoint({1.f, 0.5f});
-			label->setPosition(ring->getPosition() + CCPoint{-14.f, 0.f});
-			m_objectLayer->addChild(label, 9999);
-		}
-		label->setString(std::to_string(frames).c_str());
+		auto s = Sim::get().snap(press);
+		if (!s || !m_objectLayer) return;
+		auto label = CCLabelBMFont::create(std::to_string(frames).c_str(), "bigFont.fnt");
+		label->setScale(0.45f);
 		label->setColor(colorFor(frames));
+		label->setPosition(s->position + CCPoint{0.f, 22.f});
+		label->setVisible(CounterSettings::clickLabels());
+		m_objectLayer->addChild(label, 9999);
+		f->clickLabels.push_back(label);
 	}
 };
 
 class $modify(FrameCounterGL, GJBaseGameLayer) {
-	void processCommands(float dt, bool isHalfTick, bool isLastTick) {
-		GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
-		if (auto pl = typeinfo_cast<PlayLayer*>(this)) {
-			static_cast<FrameCounterPL*>(pl)->trackOrbs();
+	void handleButton(bool down, int button, bool isPlayer1) {
+		auto& sim = Sim::get();
+		if (typeinfo_cast<PlayLayer*>(this) && button == 1 && isPlayer1 && !sim.simulating) {
+			if (down && !sim.held) sim.pending.push_back(sim.tick);
+			sim.held = down;
 		}
+		GJBaseGameLayer::handleButton(down, button, isPlayer1);
+	}
+
+	void processCommands(float dt, bool isHalfTick, bool isLastTick) {
+		auto pl = typeinfo_cast<PlayLayer*>(this);
+		auto& sim = Sim::get();
+		if (!pl || sim.simulating || m_isPlatformer || !sim.fake) {
+			GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
+			return;
+		}
+
+		sim.record(m_player1);
+		GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
+		sim.tick++;
+
+		while (!sim.ringUses.empty() && sim.ringUses.front().tick < sim.tick - BUFFER) {
+			sim.ringUses.pop_front();
+		}
+
+		// presses whose horizon has fully played out can be measured now
+		for (auto it = sim.pending.begin(); it != sim.pending.end();) {
+			if (sim.tick <= *it + HORIZON) {
+				++it;
+				continue;
+			}
+			int window = sim.measure(this, *it);
+			if (window > 0) static_cast<FrameCounterPL*>(pl)->recordWindow(*it, window);
+			it = sim.pending.erase(it);
+		}
+	}
+
+	// keep the fake player from touching anything but solids, hazards, orbs,
+	// pads and portals, so the replay doesn't fire triggers or collect coins
+	void collisionCheckObjects(PlayerObject* player, gd::vector<GameObject*>* objects, int count, float dt) {
+		if (!Sim::get().simulating) {
+			GJBaseGameLayer::collisionCheckObjects(player, objects, count, dt);
+			return;
+		}
+		std::vector<GameObject*> disabled;
+		for (int i = 0; i < count && i < static_cast<int>(objects->size()); i++) {
+			auto obj = objects->at(i);
+			if (!obj || obj->m_isDisabled || obj->m_isDisabled2) continue;
+			auto type = obj->m_objectType;
+			bool keep = type == GameObjectType::Solid || type == GameObjectType::Hazard
+				|| type == GameObjectType::AnimatedHazard || type == GameObjectType::Slope
+				|| typeinfo_cast<RingObject*>(obj) || obj->m_objectID == 35 || obj->m_objectID == 67
+				|| obj->m_objectID == 140 || obj->m_objectID == 1332 || obj->m_objectID == 3005
+				|| type == GameObjectType::InverseGravityPortal || type == GameObjectType::NormalGravityPortal
+				|| type == GameObjectType::MiniSizePortal || type == GameObjectType::RegularSizePortal;
+			if (keep) continue;
+			obj->m_isDisabled = true;
+			obj->m_isDisabled2 = true;
+			disabled.push_back(obj);
+		}
+		GJBaseGameLayer::collisionCheckObjects(player, objects, count, dt);
+		for (auto obj : disabled) {
+			obj->m_isDisabled = false;
+			obj->m_isDisabled2 = false;
+		}
+	}
+
+	void playerTouchedTrigger(PlayerObject* player, EffectGameObject* object) {
+		if (!Sim::get().simulating) GJBaseGameLayer::playerTouchedTrigger(player, object);
+	}
+
+	void gameEventTriggered(GJGameEvent event, int material, int playerID) {
+		if (!Sim::get().simulating) GJBaseGameLayer::gameEventTriggered(event, material, playerID);
+	}
+
+	void activateSFXTrigger(SFXTriggerGameObject* object) {
+		if (!Sim::get().simulating) GJBaseGameLayer::activateSFXTrigger(object);
+	}
+
+	void activateSongEditTrigger(SongTriggerGameObject* object) {
+		if (!Sim::get().simulating) GJBaseGameLayer::activateSongEditTrigger(object);
+	}
+};
+
+class $modify(FrameCounterPO, PlayerObject) {
+	void update(float dt) {
+		PlayerObject::update(dt);
+		auto& sim = Sim::get();
+		if (!sim.simulating && this != sim.fake) sim.dt = dt;
+	}
+
+	void ringJump(RingObject* ring, bool skipCheck) {
+		auto& sim = Sim::get();
+		if (sim.simulating) {
+			// let the fake bounce off the orb without using it up
+			bool a = ring->m_isActivated, d = ring->m_isDisabled, d2 = ring->m_isDisabled2;
+			PlayerObject::ringJump(ring, skipCheck);
+			ring->m_isActivated = a;
+			ring->m_isDisabled = d;
+			ring->m_isDisabled2 = d2;
+			return;
+		}
+		sim.ringUses.push_back({ring, sim.tick, ring->m_isActivated, ring->m_isDisabled, ring->m_isDisabled2});
+		PlayerObject::ringJump(ring, skipCheck);
+	}
+
+	void incrementJumps() {
+		if (!Sim::get().simulating) PlayerObject::incrementJumps();
+	}
+
+	void playSpiderDashEffect(CCPoint from, CCPoint to) {
+		if (!Sim::get().simulating) PlayerObject::playSpiderDashEffect(from, to);
+	}
+};
+
+class $modify(HardStreak) {
+	void addPoint(CCPoint point) {
+		if (!Sim::get().simulating) HardStreak::addPoint(point);
+	}
+};
+
+class $modify(GameObject) {
+	void playShineEffect() {
+		if (!Sim::get().simulating) GameObject::playShineEffect();
 	}
 };
 
@@ -316,8 +602,8 @@ void FrameCounterPopup::refreshPanel() {
 		if (auto panel = pl->getChildByID("frame-counter-panel"_spr)) {
 			applyPanelSettings(panel);
 		}
-		for (auto& [ring, label] : static_cast<FrameCounterPL*>(pl)->m_fields->orbLabels) {
-			label->setVisible(CounterSettings::orbLabels());
+		for (auto label : static_cast<FrameCounterPL*>(pl)->m_fields->clickLabels) {
+			label->setVisible(CounterSettings::clickLabels());
 		}
 	}
 }
