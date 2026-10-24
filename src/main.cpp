@@ -8,78 +8,116 @@
 
 using namespace geode::prelude;
 
-// settings, saved between sessions; x/y are fractions of the screen (0..1)
+// ---------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------
+
+static constexpr int FPS_OPTIONS[] = {240, 165, 144, 120, 75, 60, 30};
+
 struct CounterSettings {
-	static bool enabled() { return Mod::get()->getSavedValue<bool>("enabled", true); }
-	static bool clickLabels() { return Mod::get()->getSavedValue<bool>("click-labels", true); }
-	static bool ding() { return Mod::get()->getSavedValue<bool>("ding", true); }
-	static float x() { return Mod::get()->getSavedValue<float>("x", 0.01f); }
-	static float y() { return Mod::get()->getSavedValue<float>("y", 0.98f); }
-	static float scale() { return Mod::get()->getSavedValue<float>("scale", 0.5f); }
-	static float opacity() { return Mod::get()->getSavedValue<float>("opacity", 1.f); }
+	static bool get(char const* key, bool def) { return Mod::get()->getSavedValue<bool>(key, def); }
+	static float num(char const* key, float def) { return Mod::get()->getSavedValue<float>(key, def); }
+
+	static bool enabled() { return get("enabled", true); }
+	static bool markers() { return get("click-labels", true); }
+	static bool ding() { return get("ding", true); }
+	static bool debug() { return get("debug", false); }
+	static float x() { return num("x", 0.01f); }
+	static float y() { return num("y", 0.98f); }
+	static float scale() { return num("scale", 0.5f); }
+	static float opacity() { return num("opacity", 1.f); }
+	static float markerSize() { return num("marker-size", 1.f); }
+	static float volume() { return num("volume", 0.8f); }
+	static int fps() { return Mod::get()->getSavedValue<int>("fps", 240); }
 };
 
-// window-size buckets, top row of the panel first
+static float defaultFor(std::string_view key) {
+	if (key == "x") return 0.01f;
+	if (key == "y") return 0.98f;
+	if (key == "scale") return 0.5f;
+	if (key == "opacity") return 1.f;
+	if (key == "marker-size") return 1.f;
+	return 0.8f;  // volume
+}
+
+// ---------------------------------------------------------------------------
+// Buckets: hardest at the top. A window is measured in physics ticks (240/s)
+// and shown in the chosen FPS, so at 60 FPS one tick is 0.25 frames.
+// ---------------------------------------------------------------------------
+
 struct Bucket {
 	const char* name;
-	int min, max;
+	float above, upTo;  // window is in (above, upTo]
 	ccColor3B color;
 };
 static constexpr int BUCKET_COUNT = 7;
 static Bucket const BUCKETS[BUCKET_COUNT] = {
-	{"9-12:", 9, 12, {110, 110, 255}},
-	{"7-8:", 7, 8, {90, 200, 255}},
-	{"5-6:", 5, 6, {100, 230, 100}},
-	{"4:", 4, 4, {255, 255, 255}},
-	{"3:", 3, 3, {255, 220, 0}},
-	{"2:", 2, 2, {255, 150, 30}},
-	{"1:", 1, 1, {255, 60, 60}},
+	{"1:", 0.f, 1.f, {255, 60, 60}},
+	{"2:", 1.f, 2.f, {255, 150, 30}},
+	{"3:", 2.f, 3.f, {255, 220, 0}},
+	{"4:", 3.f, 4.f, {255, 255, 255}},
+	{"5-6:", 4.f, 6.f, {100, 230, 100}},
+	{"7-8:", 6.f, 8.f, {90, 200, 255}},
+	{"9-12:", 8.f, 12.f, {110, 110, 255}},
 };
 
-// windows wider than 12 frames are easy, so they're not counted
-static int bucketFor(int frames) {
+static float toFrames(int ticks) {
+	return ticks * CounterSettings::fps() / 240.f;
+}
+
+static int bucketFor(float frames) {
 	for (int i = 0; i < BUCKET_COUNT; i++) {
-		if (frames >= BUCKETS[i].min && frames <= BUCKETS[i].max) return i;
+		if (frames > BUCKETS[i].above && frames <= BUCKETS[i].upTo) return i;
 	}
 	return -1;
 }
 
-static ccColor3B colorFor(int frames) {
+static ccColor3B colorFor(float frames) {
 	auto b = bucketFor(frames);
 	return b < 0 ? ccColor3B{200, 200, 200} : BUCKETS[b].color;
 }
 
-// ding for every counted window; the tighter the window, the lower the pitch
-// (1 frame plays at half speed, 12 frames at normal speed)
-static void playDing(int frames) {
-	if (!CounterSettings::ding() || bucketFor(frames) < 0) return;
-	float speed = 0.5f + 0.5f * (frames - 1) / 11.f;
-	FMODAudioEngine::get()->playEffect("ding.wav"_spr, speed, 0.f, 1.f);
+static std::string formatFrames(float frames) {
+	auto s = fmt::format("{:.2f}", frames);
+	while (s.back() == '0') s.pop_back();
+	if (s.back() == '.') s.pop_back();
+	return s;
 }
 
-static void applyPanelSettings(CCNode* panel) {
-	auto win = CCDirector::get()->getWinSize();
-	panel->setVisible(CounterSettings::enabled());
-	panel->setPosition({win.width * CounterSettings::x(), win.height * CounterSettings::y()});
-	panel->setScale(CounterSettings::scale());
-	auto opacity = static_cast<GLubyte>(CounterSettings::opacity() * 255);
-	for (auto child : CCArrayExt<CCLabelBMFont*>(panel->getChildren())) {
-		child->setOpacity(opacity);
+// ---------------------------------------------------------------------------
+// Ding: a sound file named ding.ogg / ding.mp3 / ding.wav in the mod's config
+// folder replaces the built-in one. Tighter windows play at a lower pitch.
+// ---------------------------------------------------------------------------
+
+static std::string dingPath() {
+	for (auto name : {"ding.ogg", "ding.mp3", "ding.wav"}) {
+		auto path = Mod::get()->getConfigDir() / name;
+		std::error_code ec;
+		if (std::filesystem::exists(path, ec)) return utils::string::pathToString(path);
 	}
+	return "ding.wav"_spr;
+}
+
+static void playDing(float frames) {
+	if (!CounterSettings::ding() || bucketFor(frames) < 0) return;
+	// 1 frame plays at half speed, 12 frames at normal speed
+	float speed = 0.5f + 0.5f * (std::clamp(frames, 1.f, 12.f) - 1.f) / 11.f;
+	FMODAudioEngine::get()->playEffect(dingPath(), speed, 0.f, CounterSettings::volume());
 }
 
 // ---------------------------------------------------------------------------
 // Trajectory simulation
 //
-// Every physics tick we save player 1's state and whether jump is held. When
-// the player presses jump on tick F, we wait HORIZON ticks, then replay that
-// stretch with an invisible fake player, moving the press 1, 2, 3... ticks
-// earlier and later. The window is the number of press ticks that survive.
+// Every physics tick we save player 1's state and whether jump is held. For
+// each press and release on tick F we wait HORIZON ticks, then replay that
+// stretch with an invisible fake player, moving that one input 1, 2, 3...
+// ticks earlier and later (never past the inputs around it). The window is
+// how many ticks in a row the input could have landed on and survived.
 // ---------------------------------------------------------------------------
 
-static constexpr int MAX_SHIFT = 12;  // furthest shift tried on each side
-static constexpr int HORIZON = 60;    // ticks after the press that must be survived
-static constexpr int BUFFER = 128;    // must be > HORIZON + MAX_SHIFT + 1
+static constexpr int MAX_SHIFT = 48;  // furthest shift tried each side (12 frames at 60 FPS)
+static constexpr int HORIZON = 60;    // ticks after the input that must be survived
+static constexpr int BUFFER = 256;    // must be > HORIZON + MAX_SHIFT + 2
 
 struct Snapshot {
 	int tick = -1;
@@ -88,13 +126,22 @@ struct Snapshot {
 	double yVelocity = 0;
 	bool onGround = false;
 	float rotation = 0.f;
-	bool held = false;  // jump held during this tick
+	bool held = false;  // jump held during this tick (after inputs were processed)
+};
+
+struct InputEvent {
+	int tick;
+	bool down;
 };
 
 struct RingUse {
 	RingObject* ring;
 	int tick;
 	bool activated, disabled, disabled2;  // flags before the real player used it
+};
+
+struct Stats {
+	int inputs = 0, measured = 0, mismatched = 0, skipped = 0;
 };
 
 struct Sim {
@@ -106,8 +153,10 @@ struct Sim {
 	bool held = false;
 	int realDeathTick = -1;
 	std::array<Snapshot, BUFFER> snaps;
-	std::vector<int> pending;
+	std::vector<InputEvent> events;
+	std::vector<InputEvent> pending;
 	std::deque<RingUse> ringUses;
+	Stats stats;
 
 	static Sim& get() {
 		static Sim instance;
@@ -118,8 +167,10 @@ struct Sim {
 		tick = 0;
 		held = false;
 		realDeathTick = -1;
+		events.clear();
 		pending.clear();
 		ringUses.clear();
+		stats = {};
 		for (auto& s : snaps) s.tick = -1;
 	}
 
@@ -141,15 +192,20 @@ struct Sim {
 		s.tick = tick;
 	}
 
-	// input for tick t when the press at `press` is shifted by `shift` ticks
-	bool heldAt(int t, int press, int shift) {
+	void input(bool down) {
+		if (down == held) return;
+		held = down;
+		events.push_back({tick, down});
+		pending.push_back({tick, down});
+		stats.inputs++;
+	}
+
+	// input for tick t when `ev` is moved by `shift` ticks
+	bool heldAt(int t, InputEvent ev, int shift) {
 		auto s = snap(t);
-		bool h = s && s->held;
-		if (shift < 0 && t >= press + shift && t < press) return true;
-		if (shift > 0) {
-			if (t == press + shift) return true;
-			if (t >= press && t < press + shift) return false;
-		}
+		bool h = s ? s->held : false;
+		if (shift < 0 && t >= ev.tick + shift && t < ev.tick) return ev.down;
+		if (shift > 0 && t >= ev.tick && t < ev.tick + shift) return !ev.down;
 		return h;
 	}
 
@@ -160,9 +216,10 @@ struct Sim {
 		p->m_collisionLogRight->removeAllObjects();
 	}
 
-	// true if the fake player survives to press + HORIZON
-	bool survives(GJBaseGameLayer* layer, int press, int shift) {
-		int start = press + std::min(shift, 0);
+	// replays from the earliest affected tick to ev.tick + HORIZON; returns
+	// false if the fake dies, and puts its final position in `end`
+	bool survives(GJBaseGameLayer* layer, InputEvent ev, int shift, CCPoint* end = nullptr) {
+		int start = ev.tick + std::min(shift, 0);
 		auto s = snap(start);
 		if (!s || !fake) return false;
 
@@ -188,9 +245,11 @@ struct Sim {
 
 		simulating = true;
 		fakeDied = false;
-		bool prev = false;
-		for (int t = start; t <= press + HORIZON && !fakeDied; t++) {
-			bool h = this->heldAt(t, press, shift);
+		auto before = snap(start - 1);
+		bool prev = before && before->held;
+		if (prev) fake->pushButton(PlayerButton::Jump);
+		for (int t = start; t <= ev.tick + HORIZON && !fakeDied; t++) {
+			bool h = this->heldAt(t, ev, shift);
 			if (h != prev) {
 				h ? fake->pushButton(PlayerButton::Jump) : fake->releaseButton(PlayerButton::Jump);
 				prev = h;
@@ -203,6 +262,7 @@ struct Sim {
 			fake->updatePlayerScale();
 		}
 		simulating = false;
+		if (end) *end = fake->getPosition();
 
 		for (auto& r : restore) {
 			r.ring->m_isActivated = r.activated;
@@ -212,15 +272,33 @@ struct Sim {
 		return !fakeDied;
 	}
 
-	// frames in a row the press could have happened on, or -1 if unknown
-	int measure(GJBaseGameLayer* layer, int press) {
-		if (realDeathTick >= press && realDeathTick <= press + HORIZON) return -1;
-		// if the unshifted replay dies, the simulation doesn't match this spot
-		if (!this->survives(layer, press, 0)) return -1;
+	// window in ticks, or -1 if it can't be measured reliably
+	int measure(GJBaseGameLayer* layer, InputEvent ev) {
+		if (realDeathTick >= ev.tick && realDeathTick <= ev.tick + HORIZON + 1) {
+			stats.skipped++;
+			return -1;
+		}
+
+		// the unshifted replay has to land where the real player did,
+		// otherwise the simulation doesn't match this spot
+		CCPoint end;
+		auto real = snap(ev.tick + HORIZON + 1);
+		if (!this->survives(layer, ev, 0, &end) || !real || end.getDistance(real->position) > 2.f) {
+			stats.mismatched++;
+			return -1;
+		}
+
+		// an input can't be moved past the inputs before and after it
+		int prevTick = INT_MIN, nextTick = INT_MAX;
+		for (auto& e : events) {
+			if (e.tick < ev.tick) prevTick = std::max(prevTick, e.tick);
+			if (e.tick > ev.tick) nextTick = std::min(nextTick, e.tick);
+		}
 
 		int window = 1;
-		for (int k = 1; k <= MAX_SHIFT && this->survives(layer, press, -k); k++) window++;
-		for (int k = 1; k <= MAX_SHIFT && this->survives(layer, press, k); k++) window++;
+		for (int k = 1; k <= MAX_SHIFT && ev.tick - k > prevTick && this->survives(layer, ev, -k); k++) window++;
+		for (int k = 1; k <= MAX_SHIFT && ev.tick + k < nextTick && this->survives(layer, ev, k); k++) window++;
+		stats.measured++;
 		return window;
 	}
 };
@@ -238,71 +316,92 @@ protected:
 		float min, max;
 	};
 	std::vector<Row> m_rows;
+	CCLabelBMFont* m_fpsLabel = nullptr;
 
 	bool init() {
-		if (!Popup::init(340.f, 310.f)) return false;
+		if (!Popup::init(380.f, 380.f)) return false;
 		this->setTitle("Frame Window Counter");
 
-		this->addToggle("Show counter", "enabled", CounterSettings::enabled(), -48.f);
-		this->addToggle("Click numbers", "click-labels", CounterSettings::clickLabels(), -76.f);
-		this->addToggle("Ding sound", "ding", CounterSettings::ding(), -104.f);
+		this->addToggle("Show counter", "enabled", CounterSettings::enabled(), -165.f, -48.f);
+		this->addToggle("Click markers", "click-labels", CounterSettings::markers(), 20.f, -48.f);
+		this->addToggle("Ding sound", "ding", CounterSettings::ding(), -165.f, -76.f);
+		this->addToggle("Debug info", "debug", CounterSettings::debug(), 20.f, -76.f);
 
-		this->addRow("Size", "scale", 0.15f, 1.5f, -140.f);
-		this->addRow("Move X", "x", 0.f, 1.f, -175.f);
-		this->addRow("Move Y", "y", 0.f, 1.f, -210.f);
-		this->addRow("Opacity", "opacity", 0.1f, 1.f, -245.f);
+		this->addRow("Size", "scale", 0.15f, 1.5f, -110.f);
+		this->addRow("Move X", "x", 0.f, 1.f, -140.f);
+		this->addRow("Move Y", "y", 0.f, 1.f, -170.f);
+		this->addRow("Opacity", "opacity", 0.1f, 1.f, -200.f);
+		this->addRow("Marker size", "marker-size", 0.3f, 2.5f, -230.f);
+		this->addRow("Ding volume", "volume", 0.f, 2.f, -260.f);
+
+		auto fpsTitle = CCLabelBMFont::create("Counter FPS", "goldFont.fnt");
+		fpsTitle->setScale(0.55f);
+		fpsTitle->setAnchorPoint({0.f, 0.5f});
+		m_mainLayer->addChildAtPosition(fpsTitle, Anchor::Top, {-170.f, -292.f});
+		m_fpsLabel = CCLabelBMFont::create("", "bigFont.fnt");
+		m_fpsLabel->setScale(0.45f);
+		m_mainLayer->addChildAtPosition(m_fpsLabel, Anchor::Top, {40.f, -292.f});
+		for (int dir : {-1, 1}) {
+			auto spr = CCSprite::createWithSpriteFrameName("edit_leftBtn_001.png");
+			if (dir > 0) spr->setFlipX(true);
+			auto btn = CCMenuItemSpriteExtra::create(spr, this, menu_selector(FrameCounterPopup::onFps));
+			btn->setTag(dir);
+			m_buttonMenu->addChildAtPosition(btn, Anchor::Top, {40.f + dir * 55.f, -292.f});
+		}
+		this->updateFpsLabel();
 
 		auto resetBtn = CCMenuItemSpriteExtra::create(
 			ButtonSprite::create("Reset", "goldFont.fnt", "GJ_button_04.png", 0.7f),
 			this, menu_selector(FrameCounterPopup::onReset)
 		);
-		m_buttonMenu->addChildAtPosition(resetBtn, Anchor::Bottom, {0.f, 22.f});
+		m_buttonMenu->addChildAtPosition(resetBtn, Anchor::Bottom, {-70.f, 25.f});
+		auto folderBtn = CCMenuItemSpriteExtra::create(
+			ButtonSprite::create("Sound folder", "goldFont.fnt", "GJ_button_01.png", 0.7f),
+			this, menu_selector(FrameCounterPopup::onSoundFolder)
+		);
+		m_buttonMenu->addChildAtPosition(folderBtn, Anchor::Bottom, {60.f, 25.f});
 		return true;
 	}
 
-	void addToggle(const char* name, const char* key, bool on, float y) {
+	void addToggle(const char* name, const char* key, bool on, float x, float y) {
 		auto toggle = CCMenuItemToggler::createWithStandardSprites(
-			this, menu_selector(FrameCounterPopup::onToggle), 0.65f
+			this, menu_selector(FrameCounterPopup::onToggle), 0.6f
 		);
 		toggle->toggle(on);
 		toggle->setUserObject(CCString::create(key));
 		auto label = CCLabelBMFont::create(name, "bigFont.fnt");
-		label->setScale(0.45f);
+		label->setScale(0.4f);
 		label->setAnchorPoint({0.f, 0.5f});
-		m_buttonMenu->addChildAtPosition(toggle, Anchor::Top, {-110.f, y});
-		m_mainLayer->addChildAtPosition(label, Anchor::Top, {-88.f, y});
+		m_buttonMenu->addChildAtPosition(toggle, Anchor::Top, {x, y});
+		m_mainLayer->addChildAtPosition(label, Anchor::Top, {x + 20.f, y});
 	}
 
 	void addRow(const char* name, const char* key, float min, float max, float y) {
 		auto title = CCLabelBMFont::create(name, "goldFont.fnt");
-		title->setScale(0.55f);
+		title->setScale(0.5f);
 		title->setAnchorPoint({0.f, 0.5f});
-		m_mainLayer->addChildAtPosition(title, Anchor::Top, {-140.f, y});
+		m_mainLayer->addChildAtPosition(title, Anchor::Top, {-170.f, y});
 
-		auto slider = Slider::create(this, menu_selector(FrameCounterPopup::onSlider), 0.65f);
+		auto slider = Slider::create(this, menu_selector(FrameCounterPopup::onSlider), 0.6f);
 		slider->setTag(static_cast<int>(m_rows.size()));
-		m_mainLayer->addChildAtPosition(slider, Anchor::Top, {25.f, y});
+		m_mainLayer->addChildAtPosition(slider, Anchor::Top, {40.f, y});
 
 		auto value = CCLabelBMFont::create("", "bigFont.fnt");
 		value->setScale(0.35f);
-		m_mainLayer->addChildAtPosition(value, Anchor::Top, {125.f, y});
+		m_mainLayer->addChildAtPosition(value, Anchor::Top, {155.f, y});
 
 		m_rows.push_back({key, slider, value, min, max});
 		this->syncRow(m_rows.back());
 	}
 
-	float savedValue(Row const& row) {
-		std::string_view key = row.key;
-		if (key == "x") return CounterSettings::x();
-		if (key == "y") return CounterSettings::y();
-		if (key == "scale") return CounterSettings::scale();
-		return CounterSettings::opacity();
-	}
-
 	void syncRow(Row& row) {
-		float v = savedValue(row);
+		float v = CounterSettings::num(row.key, defaultFor(row.key));
 		row.slider->setValue((v - row.min) / (row.max - row.min));
 		row.value->setString(fmt::format("{:.2f}", v).c_str());
+	}
+
+	void updateFpsLabel() {
+		m_fpsLabel->setString(fmt::format("{} FPS", CounterSettings::fps()).c_str());
 	}
 
 	void onSlider(CCObject* sender) {
@@ -325,13 +424,33 @@ protected:
 		this->refreshPanel();
 	}
 
+	void onFps(CCObject* sender) {
+		int count = static_cast<int>(std::size(FPS_OPTIONS));
+		int idx = 0;
+		for (int i = 0; i < count; i++) {
+			if (FPS_OPTIONS[i] == CounterSettings::fps()) idx = i;
+		}
+		idx = (idx + static_cast<CCNode*>(sender)->getTag() + count) % count;
+		Mod::get()->setSavedValue<int>("fps", FPS_OPTIONS[idx]);
+		this->updateFpsLabel();
+		this->refreshPanel();
+	}
+
 	void onReset(CCObject*) {
-		Mod::get()->setSavedValue<float>("x", 0.01f);
-		Mod::get()->setSavedValue<float>("y", 0.98f);
-		Mod::get()->setSavedValue<float>("scale", 0.5f);
-		Mod::get()->setSavedValue<float>("opacity", 1.f);
+		for (auto key : {"x", "y", "scale", "opacity", "marker-size", "volume"}) {
+			Mod::get()->setSavedValue<float>(key, defaultFor(key));
+		}
 		for (auto& row : m_rows) this->syncRow(row);
 		this->refreshPanel();
+	}
+
+	void onSoundFolder(CCObject*) {
+		FLAlertLayer::create(
+			"Custom ding",
+			"Put a sound named <cy>ding.ogg</c>, <cy>ding.mp3</c> or <cy>ding.wav</c> in the folder that opens. It replaces the built-in ding.",
+			"OK"
+		)->show();
+		utils::file::openFolder(Mod::get()->getConfigDir());
 	}
 
 	void refreshPanel();
@@ -379,15 +498,48 @@ class $modify(FrameCounterPause, PauseLayer) {
 };
 
 // ---------------------------------------------------------------------------
-// Play layer: panel, labels and per-tick recording
+// Play layer: panel, markers and per-tick recording
 // ---------------------------------------------------------------------------
 
+// a press is a filled circle, a release a hollow ring; the number sits beside it
+static CCNode* createMarker(float frames, bool press) {
+	auto node = CCNode::create();
+	auto color = colorFor(frames);
+	auto c4 = ccc4FFromccc3B(color);
+
+	std::array<CCPoint, 28> verts;
+	for (size_t i = 0; i < verts.size(); i++) {
+		float a = static_cast<float>(i) / verts.size() * 2.f * static_cast<float>(M_PI);
+		verts[i] = {std::cos(a) * 9.f, std::sin(a) * 9.f};
+	}
+	auto draw = CCDrawNode::create();
+	auto fill = press ? ccColor4F{c4.r, c4.g, c4.b, 0.9f} : ccColor4F{0.f, 0.f, 0.f, 0.f};
+	auto border = press ? ccColor4F{1.f, 1.f, 1.f, 0.9f} : ccColor4F{c4.r, c4.g, c4.b, 1.f};
+	draw->drawPolygon(verts.data(), static_cast<unsigned>(verts.size()), fill, 2.f, border);
+	node->addChild(draw);
+
+	auto label = CCLabelBMFont::create(formatFrames(frames).c_str(), "bigFont.fnt");
+	label->setScale(0.45f);
+	label->setColor(color);
+	label->setAnchorPoint({0.f, 0.5f});
+	label->setPosition({13.f, 0.f});
+	node->addChild(label);
+	return node;
+}
+
 class $modify(FrameCounterPL, PlayLayer) {
+	struct Marker {
+		CCPoint world;  // position in the object layer
+		CCNode* node;
+	};
+
 	struct Fields {
 		CCNode* panel = nullptr;
+		CCNode* markerLayer = nullptr;
+		CCLabelBMFont* debugLabel = nullptr;
 		std::array<CCLabelBMFont*, BUCKET_COUNT> countLabels{};
 		std::array<int, BUCKET_COUNT> counts{};
-		std::vector<CCLabelBMFont*> clickLabels;
+		std::vector<Marker> markers;
 	};
 
 	bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
@@ -395,9 +547,16 @@ class $modify(FrameCounterPL, PlayLayer) {
 		Sim::get().fake = nullptr;
 		if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
 
+		// the UI layer isn't flipped by mirror portals or moved by the camera
+		CCNode* hud = m_uiLayer ? static_cast<CCNode*>(m_uiLayer) : this;
+
+		auto markerLayer = CCNode::create();
+		markerLayer->setID("frame-counter-markers"_spr);
+		hud->addChild(markerLayer, 999);
+		m_fields->markerLayer = markerLayer;
+
 		auto panel = CCNode::create();
 		panel->setID("frame-counter-panel"_spr);
-		panel->setZOrder(1000);
 		for (int i = 0; i < BUCKET_COUNT; i++) {
 			auto name = CCLabelBMFont::create(BUCKETS[i].name, "bigFont.fnt");
 			name->setAnchorPoint({0.f, 1.f});
@@ -412,10 +571,31 @@ class $modify(FrameCounterPL, PlayLayer) {
 			panel->addChild(count);
 			m_fields->countLabels[i] = count;
 		}
-		applyPanelSettings(panel);
-		this->addChild(panel);
+		auto debug = CCLabelBMFont::create("", "chatFont.fnt");
+		debug->setAnchorPoint({0.f, 1.f});
+		debug->setPosition({0.f, -BUCKET_COUNT * 36.f - 6.f});
+		panel->addChild(debug);
+		m_fields->debugLabel = debug;
+		hud->addChild(panel, 1000);
 		m_fields->panel = panel;
+		this->applySettings();
 		return true;
+	}
+
+	void applySettings() {
+		auto f = m_fields.self();
+		if (!f->panel) return;
+		auto win = CCDirector::get()->getWinSize();
+		f->panel->setVisible(CounterSettings::enabled());
+		f->panel->setPosition({win.width * CounterSettings::x(), win.height * CounterSettings::y()});
+		f->panel->setScale(CounterSettings::scale());
+		auto opacity = static_cast<GLubyte>(CounterSettings::opacity() * 255);
+		for (auto label : CCArrayExt<CCLabelBMFont*>(f->panel->getChildren())) {
+			label->setOpacity(opacity);
+		}
+		f->debugLabel->setVisible(CounterSettings::debug());
+		f->markerLayer->setVisible(CounterSettings::markers());
+		for (auto& m : f->markers) m.node->setScale(CounterSettings::markerSize());
 	}
 
 	void setupHasCompleted() {
@@ -441,8 +621,8 @@ class $modify(FrameCounterPL, PlayLayer) {
 		for (auto label : f->countLabels) {
 			if (label) label->setString("0");
 		}
-		for (auto label : f->clickLabels) label->removeFromParent();
-		f->clickLabels.clear();
+		for (auto& m : f->markers) m.node->removeFromParent();
+		f->markers.clear();
 	}
 
 	void destroyPlayer(PlayerObject* player, GameObject* object) {
@@ -459,8 +639,32 @@ class $modify(FrameCounterPL, PlayLayer) {
 		if (!Sim::get().simulating) PlayLayer::playEndAnimationToPos(pos);
 	}
 
-	void recordWindow(int press, int frames) {
+	void postUpdate(float dt) {
+		PlayLayer::postUpdate(dt);
 		auto f = m_fields.self();
+		if (!f->markerLayer) return;
+
+		// keep markers on their world spot but drawn upright in the HUD
+		auto win = CCDirector::get()->getWinSize();
+		for (auto& m : f->markers) {
+			auto screen = m_objectLayer->convertToWorldSpace(m.world);
+			auto local = f->markerLayer->convertToNodeSpace(screen);
+			m.node->setPosition(local);
+			m.node->setVisible(screen.x > -60.f && screen.x < win.width + 60.f && screen.y > -60.f && screen.y < win.height + 60.f);
+		}
+
+		if (CounterSettings::debug()) {
+			auto& s = Sim::get().stats;
+			f->debugLabel->setString(fmt::format(
+				"inputs {}  measured {}  mismatch {}  died {}",
+				s.inputs, s.measured, s.mismatched, s.skipped
+			).c_str());
+		}
+	}
+
+	void recordWindow(InputEvent ev, int ticks) {
+		auto f = m_fields.self();
+		float frames = toFrames(ticks);
 		auto b = bucketFor(frames);
 		if (b >= 0) {
 			f->counts[b]++;
@@ -468,15 +672,12 @@ class $modify(FrameCounterPL, PlayLayer) {
 		}
 		playDing(frames);
 
-		auto s = Sim::get().snap(press);
-		if (!s || !m_objectLayer) return;
-		auto label = CCLabelBMFont::create(std::to_string(frames).c_str(), "bigFont.fnt");
-		label->setScale(0.45f);
-		label->setColor(colorFor(frames));
-		label->setPosition(s->position + CCPoint{0.f, 22.f});
-		label->setVisible(CounterSettings::clickLabels());
-		m_objectLayer->addChild(label, 9999);
-		f->clickLabels.push_back(label);
+		auto s = Sim::get().snap(ev.tick);
+		if (!s || !f->markerLayer) return;
+		auto node = createMarker(frames, ev.down);
+		node->setScale(CounterSettings::markerSize());
+		f->markerLayer->addChild(node);
+		f->markers.push_back({s->position, node});
 	}
 };
 
@@ -484,8 +685,7 @@ class $modify(FrameCounterGL, GJBaseGameLayer) {
 	void handleButton(bool down, int button, bool isPlayer1) {
 		auto& sim = Sim::get();
 		if (typeinfo_cast<PlayLayer*>(this) && button == 1 && isPlayer1 && !sim.simulating) {
-			if (down && !sim.held) sim.pending.push_back(sim.tick);
-			sim.held = down;
+			sim.input(down);
 		}
 		GJBaseGameLayer::handleButton(down, button, isPlayer1);
 	}
@@ -500,21 +700,26 @@ class $modify(FrameCounterGL, GJBaseGameLayer) {
 
 		sim.record(m_player1);
 		GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
+		// queued inputs are handled inside the tick, so the held state for
+		// this tick is only known now
+		if (auto s = sim.snap(sim.tick)) s->held = sim.held;
 		sim.tick++;
 
 		while (!sim.ringUses.empty() && sim.ringUses.front().tick < sim.tick - BUFFER) {
 			sim.ringUses.pop_front();
 		}
+		std::erase_if(sim.events, [&](InputEvent const& e) { return e.tick < sim.tick - BUFFER; });
 
-		// presses whose horizon has fully played out can be measured now
+		// inputs whose horizon has fully played out can be measured now
 		for (auto it = sim.pending.begin(); it != sim.pending.end();) {
-			if (sim.tick <= *it + HORIZON) {
+			if (sim.tick <= it->tick + HORIZON + 1) {
 				++it;
 				continue;
 			}
-			int window = sim.measure(this, *it);
-			if (window > 0) static_cast<FrameCounterPL*>(pl)->recordWindow(*it, window);
+			auto ev = *it;
 			it = sim.pending.erase(it);
+			int window = sim.measure(this, ev);
+			if (window > 0) static_cast<FrameCounterPL*>(pl)->recordWindow(ev, window);
 		}
 	}
 
@@ -610,11 +815,6 @@ class $modify(GameObject) {
 
 void FrameCounterPopup::refreshPanel() {
 	if (auto pl = PlayLayer::get()) {
-		if (auto panel = pl->getChildByID("frame-counter-panel"_spr)) {
-			applyPanelSettings(panel);
-		}
-		for (auto label : static_cast<FrameCounterPL*>(pl)->m_fields->clickLabels) {
-			label->setVisible(CounterSettings::clickLabels());
-		}
+		static_cast<FrameCounterPL*>(pl)->applySettings();
 	}
 }
