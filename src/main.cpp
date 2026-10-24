@@ -5,6 +5,8 @@
 #include <Geode/modify/PlayerObject.hpp>
 #include <Geode/modify/HardStreak.hpp>
 #include <Geode/modify/GameObject.hpp>
+#include <climits>
+#include <filesystem>
 
 using namespace geode::prelude;
 
@@ -93,7 +95,7 @@ static std::string dingPath() {
 	for (auto name : {"ding.ogg", "ding.mp3", "ding.wav"}) {
 		auto path = Mod::get()->getConfigDir() / name;
 		std::error_code ec;
-		if (std::filesystem::exists(path, ec)) return utils::string::pathToString(path);
+		if (std::filesystem::exists(path, ec)) return path.string();
 	}
 	return "ding.wav"_spr;
 }
@@ -509,7 +511,7 @@ static CCNode* createMarker(float frames, bool press) {
 
 	std::array<CCPoint, 28> verts;
 	for (size_t i = 0; i < verts.size(); i++) {
-		float a = static_cast<float>(i) / verts.size() * 2.f * static_cast<float>(M_PI);
+		float a = static_cast<float>(i) / verts.size() * 6.2831853f;
 		verts[i] = {std::cos(a) * 9.f, std::sin(a) * 9.f};
 	}
 	auto draw = CCDrawNode::create();
