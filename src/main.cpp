@@ -21,7 +21,7 @@ static void applyLabelSettings(CCLabelBMFont* label) {
 	label->setOpacity(static_cast<GLubyte>(CounterSettings::opacity() * 255));
 }
 
-class FrameCounterPopup : public Popup<> {
+class FrameCounterPopup : public Popup {
 protected:
 	struct Row {
 		const char* key;
@@ -31,7 +31,8 @@ protected:
 	};
 	std::vector<Row> m_rows;
 
-	bool setup() override {
+	bool init() {
+		if (!Popup::init(340.f, 270.f)) return false;
 		this->setTitle("Frame Counter");
 
 		auto toggle = CCMenuItemToggler::createWithStandardSprites(
@@ -127,7 +128,7 @@ protected:
 public:
 	static FrameCounterPopup* create() {
 		auto ret = new FrameCounterPopup();
-		if (ret->initAnchored(340.f, 270.f)) {
+		if (ret->init()) {
 			ret->autorelease();
 			return ret;
 		}
