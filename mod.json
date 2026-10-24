@@ -1,0 +1,14 @@
+{
+	"geode": "4.10.0",
+	"gd": {
+		"win": "2.2074",
+		"android": "2.2074",
+		"mac": "2.2074",
+		"ios": "2.2074"
+	},
+	"id": "user.frame-counter",
+	"name": "Frame Counter",
+	"version": "v1.0.0",
+	"developer": "you",
+	"description": "Shows the current physics frame (tick) in a level and the total frame count when you beat it."
+}
