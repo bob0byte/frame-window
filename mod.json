@@ -6,6 +6,9 @@
 		"mac": "2.2081",
 		"ios": "2.2081"
 	},
+	"resources": {
+		"files": ["resources/ding.wav"]
+	},
 	"dependencies": {
 		"geode.node-ids": ">=v1.23.3"
 	},

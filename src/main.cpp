@@ -12,6 +12,7 @@ using namespace geode::prelude;
 struct CounterSettings {
 	static bool enabled() { return Mod::get()->getSavedValue<bool>("enabled", true); }
 	static bool clickLabels() { return Mod::get()->getSavedValue<bool>("click-labels", true); }
+	static bool ding() { return Mod::get()->getSavedValue<bool>("ding", true); }
 	static float x() { return Mod::get()->getSavedValue<float>("x", 0.01f); }
 	static float y() { return Mod::get()->getSavedValue<float>("y", 0.98f); }
 	static float scale() { return Mod::get()->getSavedValue<float>("scale", 0.5f); }
@@ -46,6 +47,14 @@ static int bucketFor(int frames) {
 static ccColor3B colorFor(int frames) {
 	auto b = bucketFor(frames);
 	return b < 0 ? ccColor3B{200, 200, 200} : BUCKETS[b].color;
+}
+
+// ding for every counted window; the tighter the window, the lower the pitch
+// (1 frame plays at half speed, 12 frames at normal speed)
+static void playDing(int frames) {
+	if (!CounterSettings::ding() || bucketFor(frames) < 0) return;
+	float speed = 0.5f + 0.5f * (frames - 1) / 11.f;
+	FMODAudioEngine::get()->playEffect("ding.wav"_spr, speed, 0.f, 1.f);
 }
 
 static void applyPanelSettings(CCNode* panel) {
@@ -231,16 +240,17 @@ protected:
 	std::vector<Row> m_rows;
 
 	bool init() {
-		if (!Popup::init(340.f, 290.f)) return false;
+		if (!Popup::init(340.f, 310.f)) return false;
 		this->setTitle("Frame Window Counter");
 
-		this->addToggle("Show counter", "enabled", CounterSettings::enabled(), -50.f);
-		this->addToggle("Click numbers", "click-labels", CounterSettings::clickLabels(), -82.f);
+		this->addToggle("Show counter", "enabled", CounterSettings::enabled(), -48.f);
+		this->addToggle("Click numbers", "click-labels", CounterSettings::clickLabels(), -76.f);
+		this->addToggle("Ding sound", "ding", CounterSettings::ding(), -104.f);
 
-		this->addRow("Size", "scale", 0.15f, 1.5f, -120.f);
-		this->addRow("Move X", "x", 0.f, 1.f, -155.f);
-		this->addRow("Move Y", "y", 0.f, 1.f, -190.f);
-		this->addRow("Opacity", "opacity", 0.1f, 1.f, -225.f);
+		this->addRow("Size", "scale", 0.15f, 1.5f, -140.f);
+		this->addRow("Move X", "x", 0.f, 1.f, -175.f);
+		this->addRow("Move Y", "y", 0.f, 1.f, -210.f);
+		this->addRow("Opacity", "opacity", 0.1f, 1.f, -245.f);
 
 		auto resetBtn = CCMenuItemSpriteExtra::create(
 			ButtonSprite::create("Reset", "goldFont.fnt", "GJ_button_04.png", 0.7f),
@@ -456,6 +466,7 @@ class $modify(FrameCounterPL, PlayLayer) {
 			f->counts[b]++;
 			f->countLabels[b]->setString(std::to_string(f->counts[b]).c_str());
 		}
+		playDing(frames);
 
 		auto s = Sim::get().snap(press);
 		if (!s || !m_objectLayer) return;
