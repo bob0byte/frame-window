@@ -1,5 +1,6 @@
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
+#include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PauseLayer.hpp>
 
 using namespace geode::prelude;
@@ -7,18 +8,52 @@ using namespace geode::prelude;
 // settings, saved between sessions; x/y are fractions of the screen (0..1)
 struct CounterSettings {
 	static bool enabled() { return Mod::get()->getSavedValue<bool>("enabled", true); }
+	static bool orbLabels() { return Mod::get()->getSavedValue<bool>("orb-labels", true); }
 	static float x() { return Mod::get()->getSavedValue<float>("x", 0.01f); }
 	static float y() { return Mod::get()->getSavedValue<float>("y", 0.98f); }
-	static float scale() { return Mod::get()->getSavedValue<float>("scale", 0.4f); }
-	static float opacity() { return Mod::get()->getSavedValue<float>("opacity", 0.7f); }
+	static float scale() { return Mod::get()->getSavedValue<float>("scale", 0.5f); }
+	static float opacity() { return Mod::get()->getSavedValue<float>("opacity", 1.f); }
 };
 
-static void applyLabelSettings(CCLabelBMFont* label) {
+// window-size buckets, top row of the panel first
+struct Bucket {
+	const char* name;
+	int min, max;
+	ccColor3B color;
+};
+static constexpr int BUCKET_COUNT = 7;
+static Bucket const BUCKETS[BUCKET_COUNT] = {
+	{"9-12:", 9, 12, {110, 110, 255}},
+	{"7-8:", 7, 8, {90, 200, 255}},
+	{"5-6:", 5, 6, {100, 230, 100}},
+	{"4:", 4, 4, {255, 255, 255}},
+	{"3:", 3, 3, {255, 220, 0}},
+	{"2:", 2, 2, {255, 150, 30}},
+	{"1:", 1, 1, {255, 60, 60}},
+};
+
+// windows wider than 12 frames are easy, so they're not counted
+static int bucketFor(int frames) {
+	for (int i = 0; i < BUCKET_COUNT; i++) {
+		if (frames >= BUCKETS[i].min && frames <= BUCKETS[i].max) return i;
+	}
+	return -1;
+}
+
+static ccColor3B colorFor(int frames) {
+	auto b = bucketFor(frames);
+	return b < 0 ? ccColor3B{200, 200, 200} : BUCKETS[b].color;
+}
+
+static void applyPanelSettings(CCNode* panel) {
 	auto win = CCDirector::get()->getWinSize();
-	label->setVisible(CounterSettings::enabled());
-	label->setPosition({win.width * CounterSettings::x(), win.height * CounterSettings::y()});
-	label->setScale(CounterSettings::scale());
-	label->setOpacity(static_cast<GLubyte>(CounterSettings::opacity() * 255));
+	panel->setVisible(CounterSettings::enabled());
+	panel->setPosition({win.width * CounterSettings::x(), win.height * CounterSettings::y()});
+	panel->setScale(CounterSettings::scale());
+	auto opacity = static_cast<GLubyte>(CounterSettings::opacity() * 255);
+	for (auto child : CCArrayExt<CCLabelBMFont*>(panel->getChildren())) {
+		child->setOpacity(opacity);
+	}
 }
 
 class FrameCounterPopup : public Popup {
@@ -32,22 +67,16 @@ protected:
 	std::vector<Row> m_rows;
 
 	bool init() {
-		if (!Popup::init(340.f, 270.f)) return false;
-		this->setTitle("Frame Counter");
+		if (!Popup::init(340.f, 290.f)) return false;
+		this->setTitle("Frame Window Counter");
 
-		auto toggle = CCMenuItemToggler::createWithStandardSprites(
-			this, menu_selector(FrameCounterPopup::onToggle), 0.7f
-		);
-		toggle->toggle(CounterSettings::enabled());
-		auto toggleLabel = CCLabelBMFont::create("Show counter", "bigFont.fnt");
-		toggleLabel->setScale(0.45f);
-		m_buttonMenu->addChildAtPosition(toggle, Anchor::Top, {-70.f, -50.f});
-		m_mainLayer->addChildAtPosition(toggleLabel, Anchor::Top, {15.f, -50.f});
+		this->addToggle("Show counter", "enabled", CounterSettings::enabled(), -50.f);
+		this->addToggle("Orb numbers", "orb-labels", CounterSettings::orbLabels(), -82.f);
 
-		this->addRow("Size", "scale", 0.15f, 1.5f, -85.f);
-		this->addRow("Move X", "x", 0.f, 1.f, -125.f);
-		this->addRow("Move Y", "y", 0.f, 1.f, -165.f);
-		this->addRow("Opacity", "opacity", 0.1f, 1.f, -205.f);
+		this->addRow("Size", "scale", 0.15f, 1.5f, -120.f);
+		this->addRow("Move X", "x", 0.f, 1.f, -155.f);
+		this->addRow("Move Y", "y", 0.f, 1.f, -190.f);
+		this->addRow("Opacity", "opacity", 0.1f, 1.f, -225.f);
 
 		auto resetBtn = CCMenuItemSpriteExtra::create(
 			ButtonSprite::create("Reset", "goldFont.fnt", "GJ_button_04.png", 0.7f),
@@ -55,6 +84,19 @@ protected:
 		);
 		m_buttonMenu->addChildAtPosition(resetBtn, Anchor::Bottom, {0.f, 22.f});
 		return true;
+	}
+
+	void addToggle(const char* name, const char* key, bool on, float y) {
+		auto toggle = CCMenuItemToggler::createWithStandardSprites(
+			this, menu_selector(FrameCounterPopup::onToggle), 0.65f
+		);
+		toggle->toggle(on);
+		toggle->setUserObject(CCString::create(key));
+		auto label = CCLabelBMFont::create(name, "bigFont.fnt");
+		label->setScale(0.45f);
+		label->setAnchorPoint({0.f, 0.5f});
+		m_buttonMenu->addChildAtPosition(toggle, Anchor::Top, {-110.f, y});
+		m_mainLayer->addChildAtPosition(label, Anchor::Top, {-88.f, y});
 	}
 
 	void addRow(const char* name, const char* key, float min, float max, float y) {
@@ -98,32 +140,27 @@ protected:
 		float v = row.min + row.slider->getValue() * (row.max - row.min);
 		Mod::get()->setSavedValue<float>(row.key, v);
 		row.value->setString(fmt::format("{:.2f}", v).c_str());
-		this->refreshLabel();
+		this->refreshPanel();
 	}
 
 	void onToggle(CCObject* sender) {
+		auto toggle = static_cast<CCMenuItemToggler*>(sender);
+		auto key = static_cast<CCString*>(toggle->getUserObject())->getCString();
 		// toggler reports its state before flipping
-		bool on = !static_cast<CCMenuItemToggler*>(sender)->isToggled();
-		Mod::get()->setSavedValue<bool>("enabled", on);
-		this->refreshLabel();
+		Mod::get()->setSavedValue<bool>(key, !toggle->isToggled());
+		this->refreshPanel();
 	}
 
 	void onReset(CCObject*) {
 		Mod::get()->setSavedValue<float>("x", 0.01f);
 		Mod::get()->setSavedValue<float>("y", 0.98f);
-		Mod::get()->setSavedValue<float>("scale", 0.4f);
-		Mod::get()->setSavedValue<float>("opacity", 0.7f);
+		Mod::get()->setSavedValue<float>("scale", 0.5f);
+		Mod::get()->setSavedValue<float>("opacity", 1.f);
 		for (auto& row : m_rows) this->syncRow(row);
-		this->refreshLabel();
+		this->refreshPanel();
 	}
 
-	void refreshLabel() {
-		if (auto pl = PlayLayer::get()) {
-			if (auto label = typeinfo_cast<CCLabelBMFont*>(pl->getChildByID("frame-counter-label"_spr))) {
-				applyLabelSettings(label);
-			}
-		}
-	}
+	void refreshPanel();
 
 public:
 	static FrameCounterPopup* create() {
@@ -169,47 +206,118 @@ class $modify(FrameCounterPause, PauseLayer) {
 
 class $modify(FrameCounterPL, PlayLayer) {
 	struct Fields {
-		CCLabelBMFont* label = nullptr;
-		int levelFrames = 0;
+		CCNode* panel = nullptr;
+		std::array<CCLabelBMFont*, BUCKET_COUNT> countLabels{};
+		std::array<int, BUCKET_COUNT> counts{};
+		// frames the player has been touching each orb so far
+		std::unordered_map<RingObject*, int> touching;
+		// orbs whose window has already been measured
+		std::unordered_set<RingObject*> measured;
+		std::unordered_map<RingObject*, CCLabelBMFont*> orbLabels;
 	};
-
-	// physics ticks since the attempt started (240 per second in 2.2)
-	int currentFrame() {
-		return m_gameState.m_currentProgress;
-	}
 
 	bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
 		if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
 
-		auto label = CCLabelBMFont::create("Frame: 0", "bigFont.fnt");
-		label->setAnchorPoint({0.f, 1.f});
-		label->setZOrder(1000);
-		label->setID("frame-counter-label"_spr);
-		applyLabelSettings(label);
-		this->addChild(label);
-		m_fields->label = label;
+		auto panel = CCNode::create();
+		panel->setID("frame-counter-panel"_spr);
+		panel->setZOrder(1000);
+		for (int i = 0; i < BUCKET_COUNT; i++) {
+			auto name = CCLabelBMFont::create(BUCKETS[i].name, "bigFont.fnt");
+			name->setAnchorPoint({0.f, 1.f});
+			name->setColor(BUCKETS[i].color);
+			name->setPosition({0.f, -i * 36.f});
+			panel->addChild(name);
+
+			auto count = CCLabelBMFont::create("0", "bigFont.fnt");
+			count->setAnchorPoint({0.f, 1.f});
+			count->setColor(BUCKETS[i].color);
+			count->setPosition({115.f, -i * 36.f});
+			panel->addChild(count);
+			m_fields->countLabels[i] = count;
+		}
+		applyPanelSettings(panel);
+		this->addChild(panel);
+		m_fields->panel = panel;
 		return true;
 	}
 
-	void postUpdate(float dt) {
-		PlayLayer::postUpdate(dt);
-		if (!m_fields->label || !m_fields->label->isVisible()) return;
-
-		auto frames = this->currentFrame();
-		auto text = fmt::format("Frame: {} ({:.3f}s)", frames, frames / 240.0);
-		if (m_fields->levelFrames > 0) {
-			text += fmt::format("\nLevel: {} frames", m_fields->levelFrames);
+	void resetLevel() {
+		PlayLayer::resetLevel();
+		auto f = m_fields.self();
+		f->counts.fill(0);
+		f->touching.clear();
+		f->measured.clear();
+		for (auto label : f->countLabels) {
+			if (label) label->setString("0");
 		}
-		m_fields->label->setString(text.c_str());
 	}
 
-	void levelComplete() {
-		m_fields->levelFrames = this->currentFrame();
-		log::info("Level completed in {} frames", m_fields->levelFrames);
-		Notification::create(
-			fmt::format("Level length: {} frames", m_fields->levelFrames),
-			NotificationIcon::Success
-		)->show();
-		PlayLayer::levelComplete();
+	// called once per physics tick
+	void trackOrbs() {
+		auto f = m_fields.self();
+		std::unordered_set<RingObject*> now;
+		for (auto player : {m_player1, m_player2}) {
+			if (!player || !player->m_touchingRings) continue;
+			for (auto ring : CCArrayExt<RingObject*>(player->m_touchingRings)) {
+				now.insert(ring);
+			}
+		}
+
+		for (auto ring : now) {
+			if (!f->measured.contains(ring)) f->touching[ring]++;
+		}
+
+		// an orb the player stopped touching has a finished window
+		for (auto it = f->touching.begin(); it != f->touching.end();) {
+			if (now.contains(it->first)) {
+				++it;
+				continue;
+			}
+			this->recordWindow(it->first, it->second);
+			f->measured.insert(it->first);
+			it = f->touching.erase(it);
+		}
+	}
+
+	void recordWindow(RingObject* ring, int frames) {
+		auto f = m_fields.self();
+		auto b = bucketFor(frames);
+		if (b >= 0) {
+			f->counts[b]++;
+			f->countLabels[b]->setString(std::to_string(f->counts[b]).c_str());
+		}
+
+		if (!CounterSettings::orbLabels() || !m_objectLayer) return;
+		auto& label = f->orbLabels[ring];
+		if (!label) {
+			label = CCLabelBMFont::create("", "bigFont.fnt");
+			label->setScale(0.45f);
+			label->setAnchorPoint({1.f, 0.5f});
+			label->setPosition(ring->getPosition() + CCPoint{-14.f, 0.f});
+			m_objectLayer->addChild(label, 9999);
+		}
+		label->setString(std::to_string(frames).c_str());
+		label->setColor(colorFor(frames));
 	}
 };
+
+class $modify(FrameCounterGL, GJBaseGameLayer) {
+	void processCommands(float dt, bool isHalfTick, bool isLastTick) {
+		GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
+		if (auto pl = typeinfo_cast<PlayLayer*>(this)) {
+			static_cast<FrameCounterPL*>(pl)->trackOrbs();
+		}
+	}
+};
+
+void FrameCounterPopup::refreshPanel() {
+	if (auto pl = PlayLayer::get()) {
+		if (auto panel = pl->getChildByID("frame-counter-panel"_spr)) {
+			applyPanelSettings(panel);
+		}
+		for (auto& [ring, label] : static_cast<FrameCounterPL*>(pl)->m_fields->orbLabels) {
+			label->setVisible(CounterSettings::orbLabels());
+		}
+	}
+}
