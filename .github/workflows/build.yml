@@ -15,7 +15,6 @@ jobs:
           # Windows
           - name: Windows
             os: windows-latest
-            extra-cmake-args: "-DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl"
 
           # macOS
           - name: macOS
@@ -55,12 +54,14 @@ jobs:
         with:
           combine: true
           target: ${{ matrix.config.target }}
-          extra-cmake-args: ${{ matrix.config.extra-cmake-args }}
+          bindings: geode-sdk/bindings
+          bindings-ref: main
 
   package:
     name: Package builds
     runs-on: ubuntu-latest
     needs: ['build']
+    if: ${{ !cancelled() }}
 
     steps:
       - uses: geode-sdk/build-geode-mod/combine@main
