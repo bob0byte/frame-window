@@ -1,20 +1,25 @@
 {
-	"geode": "5.11.2",
-	"gd": {
-		"win": "2.2081",
-		"android": "2.2081",
-		"mac": "2.2081",
-		"ios": "2.2081"
-	},
-	"resources": {
-		"files": ["resources/ding.wav"]
-	},
-	"dependencies": {
-		"geode.node-ids": ">=v1.23.3"
-	},
-	"id": "user.frame-counter",
-	"name": "Frame Counter",
-	"version": "v1.0.0",
-	"developer": "you",
-	"description": "Shows the current physics frame (tick) in a level and the total frame count when you beat it."
+  "geode": "5.10.1",
+  "gd": {
+    "win": "2.2081",
+    "android": "2.2081",
+    "mac": "2.2081",
+    "ios": "2.2081"
+  },
+  "version": "v1.2.5",
+  "id": "user.frame-counter",
+  "name": "Frame Window Counter",
+  "description": "Macro-based frame window counter and label tool (fork of hyper-5/frame-window-counter).",
+  "early-load": false,
+  "tags": [
+    "utility",
+    "customization"
+  ],
+  "links": {
+    "source": "https://github.com/bob0byte/frame-window"
+  },
+  "developers": [
+    "C0nscious",
+    "bob0byte"
+  ]
 }
